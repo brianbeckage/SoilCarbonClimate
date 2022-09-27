@@ -1,0 +1,743 @@
+---
+title: "R Code for PLOS Climate paper 'Integrating climate change into projections of soil carbon sequestration from regenerative agriculture'"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+## Load required libraries
+
+```{r, message = F}
+
+library(RColorBrewer)
+library(hrbrthemes)
+library(extrafont)
+# extrafont::font_import() # only need to run once
+library(tidyverse)
+library(readxl)
+# devtools::install_github('MPIBGC-TEE/SoilR-exp/pkg') # install latest version of SoilR from github repo using devtools
+library(SoilR)
+library(scales)
+library(zoo)
+library(matrixStats)
+library(ggpubr)
+# remotes::install_github("coolbutuseless/ggpattern")
+library(ggpattern)
+
+```
+
+
+## Set global parameters and inits
+
+Set a few global parameter values, including the ecoregion(s) and land use(s) to use in the simulation, and store them in a parameter list object.
+
+```{r}
+
+# set global params
+params_ls <- list(n_ers = 11, # number of ecoregions to include; all = 11
+                  er_codes = "", # overrides n_ers to focus on specific ers, else use ""
+                  lu_labs = c("crops", "hay", "pasture", "crops_opt", "pasture_opt", "forest", "og_forest"),
+                  lu_labs_known_soc = c("crops", "hay", "pasture", "pasture_opt", "forest", "og_forest"),
+                  lu_labs_sims = c("crops", "hay", "pasture"),
+                  scn_labs = c("bau", "opt", "all_past", "all_past_opt", "all_for", "all_og_for"), # scenarios to evaluate
+                  gcms = c("ccsm4", "miroc-esm", "noresm1-m", "mri-cgcm3"),
+                  soil_thick = 30,
+                  t0_yr = 2022,
+                  n_yrs_init = 750,
+                  n_yrs = 77, # sim from 2022 - 2099 (end of epscor data)
+                  dpm_rpm_ratio = "default")
+
+```
+
+
+Initialize timestep list vectors, list objects for input data and results, and some settings.
+
+```{r}
+
+# create a vector of monthly timesteps to run the simulation
+params_ls$tsteps_spinup <- seq(1/12, params_ls$n_yrs_init, by=1/12)
+params_ls$tsteps <- seq(1/12, params_ls$n_yrs, by=1/12)
+
+# initialize lists to store input and output data
+gis_dat_ls <- gcm_dat_ls <- scn_dat_ls <- res_ls <- list()
+
+# global color scheme for plots
+group.colors <- brewer.pal(n = 6, name = "Dark2")
+group.colors.gcm <- brewer.pal(n = 5, name = "Set1")[2:5]
+
+```
+
+
+## Import and process GIS data
+
+The GIS data input file includes, for each ecoregion, monthly averages of precipitation from NOAA, evapotranspiration from NASA remote sensing, average clay content and average soil bulk density from gSSURGO, and area devoted to each land use category from the 2016 NLCD.  ArcGIS Pro software was used to clip the geographic data to the state of Vermont, process the data (for example finding averages by Ecoregion), and merge all data into a single output csv.
+
+```{r}
+
+gis_dat <- read.csv("input_data/rothc_er_in_dat.csv")
+
+sum(gis_dat$Shape_Area) # verify we have vt total area covered - should be close to 2.4923e+10 sq. meters
+
+```
+
+
+For each Ecoregion, calculate and store key input data for RothC from gis_dat in the "gis_dat_ls" list object.  
+
+```{r}
+
+# function to populate gis data list object
+pop_gis_dat_ls <- function(er_dat, gis_dat_ls) {
+  
+  er_dat_ls <- list()
+  
+  er_dat_ls$er_name <- er_dat %>% select(contains("US_L4NAME")) %>% pull()
+  
+  er_dat_ls$clim <- list(temp = er_dat %>% select(contains("TAVG_C")) %>% unlist(use.names = F),
+                         prcp = er_dat %>% select(contains("PRCP_m")) %>% unlist(use.names = F),
+                         evap = er_dat %>% select(contains("avgs_GLDAS")) %>% unlist(use.names = F)  
+  )
+  
+  er_dat_ls$soil <- list(clay = er_dat$MEAN_chorizon_claytotal_r,
+                         bulk_dens = er_dat$MEAN_chorizon_dbovendry_r,
+                         som = list(crops = er_dat %>% select(contains("soil_lab") & contains("crops")) %>% pull(),
+                                    hay = er_dat %>% select(contains("soil_lab") & contains("hay")) %>% pull(),
+                                    pasture = er_dat %>% select(contains("soil_lab") & contains("pasture")) %>% pull(),
+                                    cons_plant = er_dat %>% select(contains("soil_lab") & contains("cons_plant")) %>% pull())
+  ) 
+  
+  vb_fact <- 0.5 # modern revision of van bemmelen factor
+  
+  # calculate soil organic carbon in mg/ha for each land use in ecoregion
+  # crops, hay, pasture
+  for (lu_lab in params_ls$lu_labs_sims) {
+    som <- er_dat_ls$soil$som[[lu_lab]] # percent SOM
+    soc <- som * vb_fact # times modified van bemmelen factor
+    er_dat_ls$soil$soc_mg_ha[[lu_lab]] <- er_dat_ls$soil$bulk_dens * 3000 * soc / 100 # use bulk density to find soc mg/ha
+  }
+  
+  # pasture best management (MiG)
+  er_dat_ls$soil$soc_mg_ha$pasture_opt <- er_dat_ls$soil$soc_mg_ha$pasture * 1.22 # MIG has ~22% more SOC than continuous
+  
+  # young forest
+  forest_def_soc_mg_ha <- 96 # default soc from lit
+  cons_plt_som <- er_dat_ls$soil$som$cons_plant
+  cons_plt_soc <- cons_plt_som * vb_fact
+  cons_plt_soc_mg_ha <- er_dat_ls$soil$bulk_dens * 3000 * cons_plt_soc / 100
+  er_dat_ls$soil$soc_mg_ha$forest <- max(forest_def_soc_mg_ha, cons_plt_soc_mg_ha) # max of lit default and cons planting empirical
+  
+  # old-growth forest
+  er_dat_ls$soil$soc_mg_ha$og_forest <- 137 # default soc from lit
+  
+  # record areas for crops, hay, pasture, forest
+  # note: NLCD dataset does not differentiate between hay and pasture
+  hay_pasture <- er_dat %>% select(contains("Alfalfa") | contains("Other_Hay_Non_Alfalfa")) %>% unlist(use.names = F) %>% sum() * 100 # convert sq. km. to Ha
+  
+  er_dat_ls$area <- list(total = er_dat %>% select(Shape_Area) %>% pull() * 0.0001, # convert m^2 to Ha
+                         # nlcd_total = er_dat %>% select(contains("NLCD_ER_pivot")) %>% unlist(use.names = F) %>% sum(na.rm = T), * 100 # sanity check
+                         crops = er_dat %>% select(contains("Cultivated_Crops")) %>% pull() * 100, # convert sq. km. to Ha
+                         hay = hay_pasture * 0.513, # census of ag. VT avg. percent of grassland used for hay vs. forage
+                         pasture = hay_pasture * 0.487,
+                         forest = er_dat %>% select(contains("Forest")) %>% unlist(use.names = F) %>% sum() * 100
+  ) 
+  
+  er_dat_ls$area[is.na(er_dat_ls$area)] <- 0
+  
+  er_code <- er_dat %>% select(contains("US_L4CODE")) %>% pull()
+  gis_dat_ls[[er_code]] <- er_dat_ls
+  
+  gis_dat_ls
+}
+
+# populate gis_dat_ls for each ecoregion
+for (i in 1:nrow(gis_dat)) {
+  gis_dat_ls <- pop_gis_dat_ls(gis_dat[i,], gis_dat_ls) 
+}
+
+```
+
+
+## Set ecoregion codes to use in model
+
+```{r}
+
+if (params_ls$er_codes == "") {
+  all_er_codes <- read.csv(paste("input_data/epscor/", params_ls$gcms[1], "_P.csv", sep = "")) %>%
+    select(US_L4CODE) %>%
+    unlist()
+  params_ls$er_codes <- head(all_er_codes, n = params_ls$n_ers)
+}
+
+```
+
+
+## Import EPSCoR GCM climate data
+
+```{r}
+
+for (er_code in params_ls$er_codes) {
+  for (gcm in params_ls$gcms) {
+    for (dat_lab in c("Tmin", "Tmax", "P")) {
+      
+      full_dat_vec <- 
+        read.csv(paste("input_data/epscor/", gcm, "_", dat_lab, ".csv", sep = "")) %>% 
+        filter(US_L4CODE == er_code) %>% # select row for ecoregion 
+        select(-c(1:3)) %>% # discard metadata
+        unlist(use.names=FALSE) # convert to vector
+      
+      # rectify precip values from mm/day to mm/month
+      if (dat_lab == "P") {
+        full_dat_vec <- full_dat_vec * 30.437
+      }
+      
+      gcm_dat_ls[[er_code]][[gcm]][[dat_lab]] <- full_dat_vec
+    }
+    
+    # compute avg temp from min and max 
+    gcm_dat_ls[[er_code]][[gcm]]$Tavg <- colMeans(rbind(gcm_dat_ls[[er_code]][[gcm]]$Tmin, gcm_dat_ls[[er_code]][[gcm]]$Tmax))
+  }
+}
+
+```
+
+
+## Set land management parameters from file
+
+```{r}
+
+gen_lm_dat_ls <- function(lm_dat_file, gis_dat_ls) {
+  
+  # load data from excel file into list object
+  lm_excel_ls <- list(crops = read_excel(lm_dat_file, sheet = "Crops"),
+                      hay = read_excel(lm_dat_file, sheet = "Hay"),
+                      pasture = read_excel(lm_dat_file, sheet = "Pasture"),
+                      forest = read_excel(lm_dat_file, sheet = "Forest"),
+                      og_forest = read_excel(lm_dat_file, sheet = "OG Forest")
+  )
+  
+  # make and populate list with land management data for each land use
+  lm_dat_ls <- list()
+  
+  for (lu_lab in names(lm_excel_ls)) {
+    lm_dat <- lm_excel_ls[[lu_lab]]
+    lm_dat_ls[[lu_lab]] <- list(plt_res_c = as.numeric(lm_dat[2,2:13]),
+                                manure_c = as.numeric(lm_dat[3,2:13]),
+                                soil_cov = as.numeric(lm_dat[4,2:13]))
+    if(!is.na(lm_dat[6,1])) { # check if there is a table for best management
+      lm_dat_ls[[paste(lu_lab, "_opt", sep = "")]] = list(plt_res_c = as.numeric(lm_dat[8,2:13]),
+                                                          manure_c = as.numeric(lm_dat[9,2:13]),
+                                                          soil_cov = as.numeric(lm_dat[10,2:13]))
+    } 
+  }
+  
+  lm_dat_ls
+}
+
+lm_dat_ls <- gen_lm_dat_ls("input_data/rothc_lm_in_dat.xlsx", gis_dat_ls)
+
+```
+
+
+## Calculate effects of temp. and precip. on decomposition rates
+
+A required initial step is to calculate the combined monthly effects of temperature (fT) and moisture (fW) on the decomposition rates used in the RothC model.  These are calculated for each parameterization using the fT.RothC() and fW.RothC() functions, respectively.  Finally, *xi*, the input dataframe required by RothC, is generated by multiplying fT*fW at each timestep.  The resulting data are stored in the scn_dat_ls object.
+
+```{r}
+
+# function to calculate fT and FW vectors and xi dataframe from land management and gis data
+# stores xi in newly-generated scn_dat_ls list object
+pop_scn_dat_ls_xi <- function(gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls) {
+  
+  # populate scn_dat_ls with tstep, gis, fT, fW, and xi data
+  
+  for (er_code in params_ls$er_codes) {
+    for (lu_lab in params_ls$lu_labs) {
+      
+      # soil covered or bare each month? (0,1) - same for all treatments
+      s_cov <- lm_dat_ls[[lu_lab]]$soil_cov
+      
+      for (gcm in params_ls$gcms) {
+
+        ## SPINUP
+        
+        # spinup temp vec is monthly average over 30 year period prior to t0, repeated for all years of spinup period
+        temp_vec <- tibble(mo = rep(seq(1,12), 30),
+                           t = gcm_dat_ls[[er_code]][[gcm]]$Tavg[((41*12)+1):(71*12)]) %>% # 1992 - 2022 (30 yrs prior to sim t0)) %>% 
+          group_by(mo) %>%
+          summarize(t_mo_avg = mean(t)) %>%
+          pull(t_mo_avg) %>% unlist() %>%
+          rep(params_ls$n_yrs_init)
+        
+        # use NOAA prcp vector
+        prcp_vec <- rep(gis_dat_ls[[er_code]]$clim$prcp,
+                        params_ls$n_yrs_init)
+        
+        # evap is from gis_dat
+        evap_vec <- rep(gis_dat_ls[[er_code]]$clim$evap,
+                        params_ls$n_yrs_init)
+        
+        # fT vector; temperature effects per month
+        fT <- fT.RothC(temp_vec)
+        
+        # fW vector; moisture effects per month
+        # under vegetated conditions
+        fW_veg <- fW.RothC(P=prcp_vec,
+                           E=evap_vec,
+                           S.Thick = params_ls$soil_thick,
+                           pClay = gis_dat_ls[[er_code]]$soil$clay,
+                           pE = 1, bare = F)$b
+        
+        # under bare soil conditions
+        fW_bare <- fW.RothC(P=prcp_vec,
+                            E=evap_vec,
+                            S.Thick = params_ls$soil_thick,
+                            pClay = gis_dat_ls[[er_code]]$soil$clay,
+                            pE = 1, bare = T)$b
+        
+        # combine vegetated and bare months
+        fW <- numeric(params_ls$n_yrs_init * 12)
+        fW[s_cov == T] <- fW_veg[s_cov == T]
+        fW[s_cov == F] <- fW_bare[s_cov == F]
+        
+        # compute xi vector by multiplying fT*fW
+        scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$xi_spinup <- fT * fW
+        
+        ## SIMULATION
+        # temp projections going forward from 2022
+        temp_vec <- gcm_dat_ls[[er_code]][[gcm]]$Tavg %>% tail(params_ls$n_yrs * 12) # sim values = last n_yrs * 12
+        
+        # use NOAA prcp vector
+        prcp_vec <- rep(gis_dat_ls[[er_code]]$clim$prcp,
+                        params_ls$n_yrs)
+        
+        # evap is from gis_dat
+        evap_vec <- rep(gis_dat_ls[[er_code]]$clim$evap,
+                        params_ls$n_yrs)
+        
+        # fT vector; temperature effects per month
+        fT <- fT.RothC(temp_vec)
+        
+        # fW vector; moisture effects per month
+        # under vegetated conditions
+        fW_veg <- fW.RothC(P=prcp_vec,
+                           E=evap_vec,
+                           S.Thick = params_ls$soil_thick,
+                           pClay = gis_dat_ls[[er_code]]$soil$clay,
+                           pE = 1, bare = F)$b
+        
+        # under bare soil conditions
+        fW_bare <- fW.RothC(P=prcp_vec,
+                            E=evap_vec,
+                            S.Thick = params_ls$soil_thick,
+                            pClay = gis_dat_ls[[er_code]]$soil$clay,
+                            pE = 1, bare = T)$b
+        
+        # combine vegetated and bare months
+        fW <- numeric(params_ls$n_yrs * 12)
+        fW[s_cov == T] <- fW_veg[s_cov == T]
+        fW[s_cov == F] <- fW_bare[s_cov == F]
+        
+        # compute xi vector by multiplying fT*fW
+        scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$xi_sim <- fT * fW
+      }
+    }
+  }
+  
+  scn_dat_ls
+}
+
+scn_dat_ls <- pop_scn_dat_ls_xi(gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls)
+
+```
+
+
+## Calculate IOM proportion
+
+Even though we will assume each carbon pool starts at 0, we still need to know the proportional size of the inert organic matter (IOM) pool because this does not change over time in RothC and is independent from the model's dynamics.  It is common to use the Falloon et al. (1998) function (validated empirically) to determine the size of the IOM pool, which we calculate here based on the UVM soil lab data. 
+
+```{r}
+
+# function to initialize SOC stocks for spinup run, 
+# and calculate inert organic matter component using Falloon method
+pop_c_stocks_init <- function(scn_dat_ls, gis_dat_ls, params_ls) {
+  
+  for (er_code in params_ls$er_codes) {
+    for (lu_lab in params_ls$lu_labs_known_soc) {
+      for (gcm in c("noaa", params_ls$gcms)) {
+        
+        soc_mg_ha <- gis_dat_ls[[er_code]]$soil$soc_mg_ha[[lu_lab]] # pull soc (in Mg/Ha) from gis_dat_ls
+        
+        FallIOM <- 0.049 * soc_mg_ha^(1.139) # Falloon IOM function - gives estimate of prop. soc that's inert
+        
+        # DPM, RPM, BIO, HUM, IOM
+        scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$c_stocks_init <- c(0, 0, 0, 0, FallIOM)
+      }
+    }
+  }
+  
+  scn_dat_ls
+}
+
+scn_dat_ls <- pop_c_stocks_init(scn_dat_ls, gis_dat_ls, params_ls)
+
+```
+
+
+### Define spinup runs
+
+Now we have what we need to complete the spinup runs that calculate baseline C stocks needed for the scenario runs.  To run the model, we use the function RothCModel() to initialize and create a SoilR object which we then solve, using getC() to calculate C stocks over time for each pool.  This general procedure will be similar for the scenario runs.
+
+```{r}
+
+run_model_spinup <- function(er_code, lu_lab, gcm, gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls, plt_res_c = "default") {
+  
+  # if simply spinning up the model, use value in scn_dat_ls; when used in fitness fxn can specify plt_res_c
+  if (!is.numeric(plt_res_c) && plt_res_c == "default") {
+    plt_res_c <- scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$plt_res_c_calib
+  } 
+  
+  # format input data to df
+  # normalize to 12 months
+  plt_res_c_df <- data.frame(years = params_ls$tsteps_spinup,
+                             plt_res_c = rep(plt_res_c * 12,
+                                             params_ls$n_yrs_init))
+  
+  manure_c_df <- data.frame(years = params_ls$tsteps_spinup,
+                            manure_c = rep(lm_dat_ls[[lu_lab]]$manure_c * 12,
+                                           params_ls$n_yrs_init))
+  
+  xi_df <- data.frame(years = params_ls$tsteps_spinup,
+                      xi = scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$xi_spinup)
+  
+  # load the model
+  model <- RothCModel(t = params_ls$tsteps_spinup,
+                      C0 = scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$c_stocks_init,
+                      In = plt_res_c_df,
+                      FYM = manure_c_df,
+                      clay = gis_dat_ls[[er_code]]$soil$clay,
+                      xi = xi_df)
+  
+  c_stocks <- getC(model) # calc stocks for each pool per month
+  c_stocks
+}
+
+```
+
+
+## Adjust below-ground plant matter input levels so baseline C stock matches empirical observations
+
+It is difficult to measure the quantity of plant-derived C that is returned to the soil, especially for below-ground plant material.  The commonly-used solution is to adjust the assumed plant residue inputs such that the model's total organic C stock, post-spinup, matches empirically-observed average C stocks.  This is often called running an "inverse" RothC model.  Here we use an optimization function to determine the appropriate below-ground plant-derived C inputs, repeatedly re-running the spinup until the model's baseline total SOC (post-spinup) converges with the empirically-observed SOC measurements.  This is repeated for each ecoregion and land use.  
+
+```{r}
+
+# define fitness function for optimization
+fit_fxn <- function (bgc, er_code, lu_lab, gcm, gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls) {
+  print(paste("Checking annual BGC = ", round(bgc, 3), sep = ""))
+  
+  # assume below-ground c is only returned to soil when ground vegetated
+  grw_seas <- lm_dat_ls[[lu_lab]]$soil_cov # e.g. c(0,0,0,1,1,1,1,1,1,1,1,0)
+  bgc_vec <- grw_seas * bgc / sum(grw_seas)
+  
+  # sum above and below ground plant carbon inputs
+  plt_res_c <- lm_dat_ls[[lu_lab]]$plt_res_c + bgc_vec
+  
+  c_stocks <- run_model_spinup(er_code, lu_lab, gcm, gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls, plt_res_c = plt_res_c)
+  
+  soc_mg_ha_spinup <- tail(c_stocks, n = 12) %>% # SOC (Mg/Ha) after spinup, avg of last yr.
+    rowSums() %>% mean()
+  
+  soc_mg_ha_emp <- gis_dat_ls[[er_code]]$soil$soc_mg_ha[[lu_lab]] # empirical SOC (Mg/Ha)
+  
+  print(paste("Model C = ", round(soc_mg_ha_spinup, 3),
+              "; Empirical C = ", round(soc_mg_ha_emp, 3), 
+              "; Diff = ", round(abs(soc_mg_ha_spinup - soc_mg_ha_emp), 3), sep = ""))
+  
+  abs(soc_mg_ha_spinup - soc_mg_ha_emp) # value to minimize is absolute difference between empirical and model C stocks
+  
+}
+
+# run spinup optimization for each er and lu
+for (er_code in params_ls$er_codes) {
+  for (lu_lab in params_ls$lu_labs_known_soc) {
+    for (gcm in params_ls$gcms) {
+      
+      print(paste("*** Calibrating below-ground C, ER ", er_code, ", ", lu_lab, ", GCM = ", gcm, sep = ""))
+      
+      # run optimization
+      bgc_opt <- optimize(fit_fxn, c(0, 8), tol = .3, # can change search interval and tolerance for optimization here
+                          er_code, lu_lab, gcm, gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls) # params to pass to fit fxn
+      
+      # store bgc/yr in scn_dat_ls for later analysis
+      scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$bgc_yr <- bgc_opt$minimum
+      
+      # store resultant calibrated plt_res_c in scn_dat_ls
+      # assume below-ground c is only returned to soil when ground vegetated
+      grw_seas <- lm_dat_ls[[lu_lab]]$soil_cov # e.g. c(0,0,0,1,1,1,1,1,1,1,1,0)
+      bgc_vec <- grw_seas * bgc_opt$minimum / sum(grw_seas)
+      
+      # re-calc plt_res_c in scn_dat_ls to include below-ground c
+      scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$plt_res_c_calib <- lm_dat_ls[[lu_lab]]$plt_res_c + bgc_vec
+      
+      print("---")
+    }
+  }
+}
+
+```
+
+
+## Set initialization data for land uses where we do not have empirical data on SOC
+
+```{r}
+
+for (er_code in params_ls$er_codes) {
+  for (lu_lab in setdiff(params_ls$lu_labs, params_ls$lu_labs_known_soc)) {
+    for (gcm in params_ls$gcms) {
+      # copy c_stocks_init from business-as-usual management version (substr code removes "_opt")
+      scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$c_stocks_init <- scn_dat_ls[[er_code]][[substr(lu_lab, 0, nchar(lu_lab) - 4)]][[gcm]]$c_stocks_init
+      
+      # copy below-ground c value from business-as-usual management version (substr code removes "_opt")
+      scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$bgc_yr <- scn_dat_ls[[er_code]][[substr(lu_lab, 0, nchar(lu_lab) - 4)]][[gcm]]$bgc_yr 
+      
+      # assume below-ground c is only returned to soil when ground vegetated
+      grw_seas <- lm_dat_ls[[lu_lab]]$soil_cov # e.g. c(0,0,0,1,1,1,1,1,1,1,1,0)
+      bgc_vec <- grw_seas * scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$bgc_yr / sum(grw_seas)
+      
+      # sum above and below ground plant carbon inputs
+      scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$plt_res_c_calib <- lm_dat_ls[[lu_lab]]$plt_res_c + bgc_vec
+    }
+  }
+}
+
+```
+
+
+## Run final spinups and save results
+
+```{r}
+
+for (er_code in params_ls$er_codes) {
+  for (lu_lab in params_ls$lu_labs_sims) {
+    for (gcm in params_ls$gcms) {
+      
+      print(paste("Running final spinup, ecoregion ", er_code, ", ", lu_lab, ", GCM = ", gcm, sep = ""))
+      res_ls[[er_code]][[lu_lab]][[gcm]]$spinup$c_stocks <- run_model_spinup(er_code, lu_lab, gcm, gis_dat_ls, lm_dat_ls, scn_dat_ls, params_ls)
+      
+      scn_dat_ls[[er_code]][[lu_lab]][[gcm]]$c_stocks_init <- as.numeric(tail(res_ls[[er_code]][[lu_lab]][[gcm]]$spinup$c_stocks, n = 1))
+    }
+  }
+}
+
+```
+
+
+## Post-process spinup data
+
+```{r}
+
+# initialize statewide combined results tibble within res_ls
+for (gcm in params_ls$gcms) {
+  res_ls$all_ers[[gcm]]$spinup$c_stocks_Mg <- tibble(DPM = numeric(length = length(params_ls$tsteps_spinup)),
+                                                     RPM = numeric(length = length(params_ls$tsteps_spinup)),
+                                                     BIO = numeric(length = length(params_ls$tsteps_spinup)),
+                                                     HUM = numeric(length = length(params_ls$tsteps_spinup)),
+                                                     IOM = numeric(length = length(params_ls$tsteps_spinup)))
+}
+
+# sum spinup run c stocks (Mg) across whole state
+for (er_code in params_ls$er_codes) {
+  for (gcm in params_ls$gcms) {
+    c_stocks_Mg_this_er <- res_ls[[er_code]]$crops[[gcm]]$spinup$c_stocks * gis_dat_ls[[er_code]]$area$crops +
+      res_ls[[er_code]]$hay[[gcm]]$spinup$c_stocks * gis_dat_ls[[er_code]]$area$hay +
+      res_ls[[er_code]]$pasture[[gcm]]$spinup$c_stocks * gis_dat_ls[[er_code]]$area$pasture
+    
+    res_ls$all_ers[[gcm]]$spinup$c_stocks_Mg <- res_ls$all_ers[[gcm]]$spinup$c_stocks_Mg + c_stocks_Mg_this_er
+  }
+}
+
+```
+
+
+## Execute simulation runs
+
+We can now run the simulations for the desired scenarios (business as usual, best management with same land use, land use change to pasture, afforestation w/ harvest, afforestation to old growth) for each Ecoregion.
+
+First we define the simluation function:
+
+```{r}
+
+run_model_sim <- function(er_code, lu_lab_old, lu_lab_new, gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = F) {
+  
+  # initial c stocks are based on spinup of original land use / management
+  c_stocks_init <- scn_dat_ls[[er_code]][[lu_lab_old]][[gcm]]$c_stocks_init
+  
+  # rest of data is based on new land use / management
+  # for old growth forest scenario, ramp up c inputs from young forest levels to old-growth levels over 100 years
+  if (lu_lab_new == "og_forest") {
+    plt_res_c <- numeric()
+    for (month in 1:12) {
+      plt_res_c_month <- seq(from = scn_dat_ls[[er_code]]$forest[[gcm]]$plt_res_c_calib[month] * 12,
+                             to = scn_dat_ls[[er_code]]$og_forest[[gcm]]$plt_res_c_calib[month] * 12,
+                             length.out = params_ls$n_yrs)
+      plt_res_c[seq(month, params_ls$n_yrs * 12, 12)] <- plt_res_c_month
+    }
+  } else { # otherwise it's just drawn from scn_dat_ls
+    plt_res_c <- rep(scn_dat_ls[[er_code]][[lu_lab_new]][[gcm]]$plt_res_c_calib * 12, 
+                     params_ls$n_yrs)
+  }
+  
+  # format input data to df  
+  plt_res_c_df <- data.frame(years = params_ls$tsteps,
+                             plt_res_c = plt_res_c)
+  
+  manure_c_df <- data.frame(years = params_ls$tsteps,
+                            manure_c = rep(lm_dat_ls[[lu_lab_new]]$manure_c * 12,
+                                           params_ls$n_yrs))
+  
+  if (cc == F) {
+    xi_df <- data.frame(years = params_ls$tsteps,
+                        xi = tail(scn_dat_ls[[er_code]][[lu_lab_new]][[gcm]]$xi_spinup, 
+                                  length(scn_dat_ls[[er_code]][[lu_lab_new]][[gcm]]$xi_sim)))
+  } else if (cc == T) {
+    xi_df <- data.frame(years = params_ls$tsteps,
+                        xi = scn_dat_ls[[er_code]][[lu_lab_new]][[gcm]]$xi_sim)
+  }
+  
+  # load the model
+  model <- RothCModel(t = params_ls$tsteps,
+                      C0 = c_stocks_init,
+                      In = plt_res_c_df,
+                      FYM = manure_c_df,
+                      clay = gis_dat_ls[[er_code]]$soil$clay,
+                      xi = xi_df)
+  
+  c_stocks <- getC(model) # calc stocks for each pool per month
+}
+
+```
+
+
+Then we run the simulations:
+
+```{r}
+
+# list to lookup "opt" (best management) version of each ag land use
+lu_lab_opt_lkup = c("crops" = "crops_opt", "hay" = "hay", "pasture" = "pasture_opt")
+
+for (er_code in params_ls$er_codes) {
+  for (lu_lab in params_ls$lu_labs_sims) {
+    for (gcm in params_ls$gcms) {
+      for (cc in c(T, F)) {
+        print(paste("Running sims, ecoregion ", er_code, ", ", lu_lab, ", GCM = ", gcm, ", CC = ", cc, sep = ""))
+        
+        if (cc) cclab <- "cc" else cclab <- "static"
+        
+        # business as usual
+        res_ls[[er_code]][[lu_lab]][[gcm]][[cclab]]$bau$c_stocks <- 
+          run_model_sim(er_code, lu_lab, lu_lab, gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = cc) 
+        
+        # best management, same land use
+        res_ls[[er_code]][[lu_lab]][[gcm]][[cclab]]$opt$c_stocks <- 
+          run_model_sim(er_code, lu_lab, lu_lab_opt_lkup[lu_lab], gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = cc)
+        
+        # all ag land to pasture (current management)
+        res_ls[[er_code]][[lu_lab]][[gcm]][[cclab]]$all_past$c_stocks <- 
+          run_model_sim(er_code, lu_lab, "pasture", gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = cc)
+        
+        # all ag land to pasture (optimally managed)
+        res_ls[[er_code]][[lu_lab]][[gcm]][[cclab]]$all_past_opt$c_stocks <- 
+          run_model_sim(er_code, lu_lab, "pasture_opt", gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = cc)
+        
+        # all ag land to forest w/ timber harvest
+        res_ls[[er_code]][[lu_lab]][[gcm]][[cclab]]$all_for$c_stocks <- 
+          run_model_sim(er_code, lu_lab, "forest", gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = cc)
+        
+        # all ag land to old growth forest
+        res_ls[[er_code]][[lu_lab]][[gcm]][[cclab]]$all_og_for$c_stocks <- 
+          run_model_sim(er_code, lu_lab, "og_forest", gcm, scn_dat_ls, gis_dat_ls, res_ls, params_ls, cc = cc)
+      }
+    }
+  }
+}
+
+```
+
+
+## Post-process simulation result data
+
+```{r}
+
+# initialize statewide combined results tibbles for each scenario within res_ls
+for (gcm in params_ls$gcms) {
+  for (cc_lab in c("cc", "static")) {
+    for (scn_lab in params_ls$scn_labs) {
+      res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]] <- 
+        list(c_stocks_Mg = tibble(DPM = numeric(length = length(params_ls$tsteps)),
+                                  RPM = numeric(length = length(params_ls$tsteps)),
+                                  BIO = numeric(length = length(params_ls$tsteps)),
+                                  HUM = numeric(length = length(params_ls$tsteps)),
+                                  IOM = numeric(length = length(params_ls$tsteps))),
+             c_stock_sum_Mg = numeric(length = length(params_ls$tsteps)))
+      res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$diff <- 
+        list(c_stocks_Mg = tibble(DPM = numeric(length = length(params_ls$tsteps)),
+                                  RPM = numeric(length = length(params_ls$tsteps)),
+                                  BIO = numeric(length = length(params_ls$tsteps)),
+                                  HUM = numeric(length = length(params_ls$tsteps)),
+                                  IOM = numeric(length = length(params_ls$tsteps))),
+             c_stock_sum_Mg = numeric(length = length(params_ls$tsteps)))
+    }
+  }
+}
+
+# calculate data and save for analysis 
+for (er_code in params_ls$er_codes) {
+  for (lu_lab in params_ls$lu_labs_sims) {
+    for (gcm in params_ls$gcms) {
+      for (cc_lab in c("cc", "static")) {
+        for (scn_lab in params_ls$scn_labs) {
+          
+          # calc for each ecoregion
+          # total c stocks in all ag land
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stocks_Mg <-
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stocks * gis_dat_ls[[er_code]]$area[[lu_lab]]
+          
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stock_sum <-
+            rowSums(res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stocks)
+          
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stock_sum_Mg <-
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stock_sum * gis_dat_ls[[er_code]]$area[[lu_lab]]
+          
+          # difference to bau (sequestration qty.)
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks <-
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stocks - mean(tail(res_ls[[er_code]][[lu_lab]][[gcm]]$spinup$c_stocks, 120))
+          
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks_Mg <-
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks * gis_dat_ls[[er_code]]$area[[lu_lab]]
+          
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stock_sum <-
+            rowSums(res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks)
+          
+          res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stock_sum_Mg <-
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stock_sum * gis_dat_ls[[er_code]]$area[[lu_lab]]
+          
+          # combined vermont totals
+          # total c stocks
+          res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$c_stocks_Mg <- res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$c_stocks_Mg +
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stocks_Mg
+          
+          res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$c_stock_sum_Mg <- res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$c_stock_sum_Mg +
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$c_stock_sum_Mg
+          
+          # difference to bau (sequestration qty.)
+          res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks_Mg <- res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks_Mg +
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stocks_Mg
+          
+          res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$diff$c_stock_sum_Mg <- res_ls$all_ers[[gcm]][[cc_lab]][[scn_lab]]$diff$c_stock_sum_Mg +
+            res_ls[[er_code]][[lu_lab]][[gcm]][[cc_lab]][[scn_lab]]$diff$c_stock_sum_Mg
+        }
+      }
+    }
+  }
+}
+
+```
